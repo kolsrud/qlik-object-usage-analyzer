@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -15,7 +16,6 @@ namespace QlikObjectUsageAnalyzer
         static void Main(string[] args)
         {
             var url = "<url>";
-            var opMonId = "<id>";
             var apiKey = "<key>";
 
             var location = QcsLocation.FromUri(url);
@@ -23,13 +23,23 @@ namespace QlikObjectUsageAnalyzer
 
             var client = new RestClient(url);
             client.AsApiKeyViaQcs(apiKey);
-            var allAppIds = GetAllAppIds(client).ToArray();
             // return;
-            var sheetUsage = GetSheetUsage(location, opMonId).Result;
 
+            Main(location, client).Wait();
+        }
+
+        private static async Task Main(IQcsLocation location, RestClient client)
+        {
+            var opMonId = "";
+            var sheetUsage = await GetSheetUsage(location, opMonId);
+
+            var allAppIds = (await GetAllAppIds(client)).ToArray();
+
+            WriteLine($"Scanning {allAppIds.Length} apps.");
+            // return;
             var sw = new Stopwatch();
             sw.Start();
-            var allContents = ScanAllApps(location, allAppIds.Where(id => id != opMonId).ToArray()).Result;
+            var allContents = await ScanAllApps(location, allAppIds);
             PrintSheetContentsTable(allContents, sheetUsage);
             sw.Stop();
             WriteLine("Total time: " + sw.Elapsed);
@@ -38,39 +48,66 @@ namespace QlikObjectUsageAnalyzer
         private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanAllApps(IQcsLocation location, string[] allAppIds)
         {
             var result = new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
+            var workerPool = new WorkerPool<Dictionary<(string, string), IEnumerable<ObjectInfo>>>(8);
             foreach (var appId in allAppIds)
             {
-                var contents = await ScanApp(location, appId);
-                foreach (var (key,content) in contents)
+                workerPool.AddWork(() => ScanApp(location, appId));
+            }
+
+            var cnt = 0;
+            while (workerPool.HasWork)
+            {
+                var contents = await workerPool.GetResult();
+                Write(GetSymbol(cnt++));
+                foreach (var (key, content) in contents)
                 {
                     result[key] = content;
                 }
             }
+
             return result;
         }
 
-        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanApp(IQcsLocation location, string appId)
+        private static string GetSymbol(int i)
         {
-            Write($"Connecting to app: {appId}... ");
-            using (var app = await location.AppAsync(appId, SessionToken.Unique(), noData: true))
+            if (i % 100 == 0)
+                return (i != 0 ? Environment.NewLine : "") + i + " |";
+            if (i % 10 == 0)
+                return "|";
+            return ".";
+        }
+
+        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanApp(IQcsLocation location, string appId, bool verbose = false)
+        {
+            if (verbose) Write($"Connecting to app: {appId}... ");
+            try
             {
-                WriteLine("Done!");
-                var sheetContents = await GetSheetContents(appId, app);
-                WriteLine($"Sheet contents collected for app: {appId}");
+                using (var app = await location.AppAsync(appId, SessionToken.Unique(), noData: true))
+                {
+                    if (verbose) WriteLine("Done!");
+                    var sheetContents = await GetSheetContents(appId, app);
+                    if (verbose) WriteLine($"Sheet contents collected for app: {appId}");
 //                PrintSheetContents(sheetContents);
-                // PrintSheetContentsTable(appId, sheetContents, sheetUsage);
-                return sheetContents;
+                    // PrintSheetContentsTable(appId, sheetContents, sheetUsage);
+                    return sheetContents;
+                }
+            }
+            catch
+            {
+                Write("e");
+                return new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
             }
         }
 
-        private static IEnumerable<string> GetAllAppIds(IRestClient client)
+        private static async Task<IEnumerable<string>> GetAllAppIds(IRestClient client)
         {
-            var next = client.Url + "/api/v1/items?resourceType=app";
+            var next = client.Url + "/api/v1/items?resourceType=app&limit=100";
+            var result = new List<string>();
             while (!string.IsNullOrWhiteSpace(next))
             {
                 // WriteLine(next);
                 // WriteLine(next.Substring(client.Url.Length));
-                var rsp = client.Get(next.Substring(client.Url.Length));
+                var rsp = await client.GetAsync(next.Substring(client.Url.Length));
                 // WriteLine(rsp);
                 var appInfos = JToken.Parse(rsp);
                 foreach (var appInfo in appInfos["data"].OfType<JObject>())
@@ -79,16 +116,21 @@ namespace QlikObjectUsageAnalyzer
                     var id = appInfo["resourceId"].Value<string>();
                     WriteLine($"  {id}: {title}");
                     // WriteLine(appInfo.ToString());
-                    yield return id;
+                    result.Add(id);
                 }
                 // WriteLine(appInfos["links"].ToString());
                 next = appInfos["links"]["next"]?["href"].Value<string>();
+                // yield break;
+                break;
             }
+
+            return result;
         }
 
         private static async Task<Dictionary<(string, string), int>> GetSheetUsage(IQcsLocation location, string opMonId)
         {
             var result = new Dictionary<(string, string), int>();
+            return result;
             using (var app = await location.AppAsync(opMonId, SessionToken.Unique()))
             {
                 var cubeDef = CreateCubeDef();
@@ -126,7 +168,7 @@ namespace QlikObjectUsageAnalyzer
         private static void PrintSheetContentsTable(Dictionary<(string, string), IEnumerable<ObjectInfo>> sheetContents, Dictionary<(string, string), int> sheetUsage)
         {
             var headers = new[] { "appId", "sheetId", "usage", "objectId", "objectType", "objectTitle" };
-            WriteLine(string.Join("\t", headers));
+            WriteLine(string.Join("\t", headers), true);
             foreach (var item in sheetContents)
             {
                 int usage;
@@ -135,7 +177,7 @@ namespace QlikObjectUsageAnalyzer
                         
                 foreach (var row in item.Value.Select(o => $"{item.Key.Item1}\t{item.Key.Item2}\t{usage}\t{o.Pretty()}"))
                 {
-                    WriteLine(row);
+                    WriteLine(row, true);
                 }
             }
         }
@@ -166,14 +208,14 @@ namespace QlikObjectUsageAnalyzer
             }
         }
 
-        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> GetSheetContents(string appId, IApp app)
+        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> GetSheetContents(string appId, IApp app, bool verbose = false)
         {
             var result = new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
             using (var sheetList = await app.GetSheetListAsync())
             {
                 var layout = await sheetList.GetLayoutAsync();
                 var sheetItems = layout.AppObjectList.Items.ToArray();
-                WriteLine($"Getting sheet contents for {sheetItems.Length} sheets.");
+                if (verbose) WriteLine($"Getting sheet contents for {sheetItems.Length} sheets.");
                 foreach (var item in sheetItems)
                 {
                     var sheetId = item.Info.Id;
@@ -209,14 +251,17 @@ namespace QlikObjectUsageAnalyzer
             };
         }
 
-        private static void WriteLine(string msg = "")
+        private static void WriteLine(string msg = "", bool writeToFile = false)
         {
-            Write(msg + Environment.NewLine);
+            Write(msg + Environment.NewLine, writeToFile);
         }
 
-        private static void Write(string msg)
+        private static StreamWriter _outputFile = new StreamWriter(@"C:\Tmp\objectScan.csv", false);
+
+        private static void Write(string msg, bool writeToFile = false)
         {
             Console.Write(msg);
+            if (writeToFile) _outputFile.Write(msg);
         }
     }
 }
