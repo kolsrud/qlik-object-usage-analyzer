@@ -74,7 +74,7 @@ namespace QlikObjectUsageAnalyzer
 				Console.WriteLine($"  <apiKey>      : (-a | --apiKey) <string>");
 				Console.WriteLine($"  <workers>     : (-w | --workers) int, Number of apps to analyze concurrently. Default: 8");
 				Console.WriteLine($"  <output file> : (-o | --outputFile) <file path>, Default: Write to stdout only.");
-				Console.WriteLine($"  <verbose>     : (-v | --verbose), Write result to stdout. Default: false");
+				Console.WriteLine($"  <verbose>     : (-v | --verbose), Write result to stdout even when writing to file. Default: false");
 		    }
 		}
 
@@ -169,9 +169,9 @@ namespace QlikObjectUsageAnalyzer
                     return sheetContents;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                Write("e");
+                WriteLine($"Error during analysis of app {appId}: {ex}");
                 return new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
             }
         }
@@ -196,13 +196,19 @@ namespace QlikObjectUsageAnalyzer
                     result.Add(id);
                 }
 
-                var row = Console.CursorTop;
-                Console.SetCursorPosition(0,row);
-                Console.Write("Apps found: " + result.Count);
+                try
+                {
+	                var row = Console.CursorTop;
+	                Console.SetCursorPosition(0, row);
+                }
+                catch
+                {
+                    WriteLine();
+                }
+
+                Write("Apps found: " + result.Count);
                 // WriteLine(appInfos["links"].ToString());
                 next = appInfos["links"]["next"]?["href"].Value<string>();
-                // yield break;
-                // break;
             }
             Console.WriteLine();
             return result;
