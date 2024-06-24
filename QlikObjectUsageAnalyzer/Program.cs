@@ -178,7 +178,7 @@ namespace QlikObjectUsageAnalyzer
 
         private static async Task<IEnumerable<string>> GetAllAppIds(IRestClient client)
         {
-            var next = client.Url + "/api/v1/items?resourceType=app&limit=10";
+            var next = client.Url + "/api/v1/items?resourceType=app&limit=100";
             var result = new List<string>();
             while (!string.IsNullOrWhiteSpace(next))
             {
