@@ -13,18 +13,93 @@ namespace QlikObjectUsageAnalyzer
 {
     internal class Program
     {
+	    private class Arguments
+	    {
+		    public string Url;
+		    public string ApiKey;
+		    public int Workers = 8;
+		    public string OutputFile = null;
+		    public bool Verbose = false;
+
+		    public static Arguments ProcessArgs(string[] args)
+		    {
+			    var error = false;
+                var result = new Arguments();
+                for (int i = 0; i < args.Length; i++)
+                {
+	                switch (args[i])
+	                {
+		                case "-u":
+		                case "--url": result.Url = args[i + 1]; i++; break;
+		                case "-a":
+		                case "--apiKey": result.ApiKey = args[i + 1]; i++; break;
+		                case "-w":
+		                case "--workers": result.Workers = int.Parse(args[i + 1]); i++; break;
+		                case "-o":
+		                case "--outputFile": result.OutputFile = args[i + 1]; i++; break;
+		                case "-v":
+		                case "--verbose": result.Verbose = true; break;
+                        default:
+	                        Console.WriteLine($"Error processing arguments. Unknown argument {args[i]}");
+                            error = true;
+	                        break;
+					}
+                }
+
+                if (result.Url == null)
+                {
+	                Console.WriteLine($"Error processing arguments. Url not defined.");
+	                error = true;
+                }
+                if (result.ApiKey == null)
+                {
+	                Console.WriteLine($"Error processing arguments. ApiKey not defined.");
+	                error = true;
+                }
+
+                if (error)
+                {
+	                PrintUsage();
+	                Environment.Exit(1);
+                }
+
+                return result;
+		    }
+
+		    private static void PrintUsage()
+		    {
+			    var exe = System.AppDomain.CurrentDomain.FriendlyName;
+				Console.WriteLine($"Usage: {exe} <url> <apiKey> [<verbose>] [<workers>] [<output file>]");
+				Console.WriteLine($"  <url>         : (-u | --url) <string>");
+				Console.WriteLine($"  <apiKey>      : (-a | --apiKey) <string>");
+				Console.WriteLine($"  <workers>     : (-w | --workers) int, Number of apps to analyze concurrently. Default: 8");
+				Console.WriteLine($"  <output file> : (-o | --outputFile) <file path>, Default: Write to stdout only.");
+				Console.WriteLine($"  <verbose>     : (-v | --verbose), Write result to stdout. Default: false");
+		    }
+		}
+
+        private static bool _verbose = true;
+
         static void Main(string[] args)
         {
-            var url = "<url>";
-            var apiKey = "<key>";
+	        var config = Arguments.ProcessArgs(args);
 
-            var location = QcsLocation.FromUri(url);
-            location.AsApiKey(apiKey);
+            WriteLine($"Scanning object usage for URL: {config.Url}");
+            WriteLine($"Using {config.Workers} workers.");
+            var location = QcsLocation.FromUri(config.Url);
+            location.AsApiKey(config.ApiKey);
+            location.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
 
-            var client = new RestClient(url);
-            client.AsApiKeyViaQcs(apiKey);
-            // return;
+			var client = new RestClient(config.Url);
+            client.AsApiKeyViaQcs(config.ApiKey);
+            client.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
 
+			if (config.OutputFile != null)
+            {
+	            WriteLine($"Writing result to file: {config.OutputFile}");
+                _outputFile = new StreamWriter(config.OutputFile, false);
+                _verbose = config.Verbose;
+			}
             Main(location, client).Wait();
         }
 
@@ -39,16 +114,18 @@ namespace QlikObjectUsageAnalyzer
             // return;
             var sw = new Stopwatch();
             sw.Start();
-            var allContents = await ScanAllApps(location, allAppIds);
+            var allContents = await ScanAllApps(location, allAppIds, 8);
             PrintSheetContentsTable(allContents, sheetUsage);
             sw.Stop();
+            WriteLine();
+            WriteLine($"Found {allContents.Count} objects.");
             WriteLine("Total time: " + sw.Elapsed);
         }
 
-        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanAllApps(IQcsLocation location, string[] allAppIds)
+        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanAllApps(IQcsLocation location, string[] allAppIds, int workers)
         {
             var result = new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
-            var workerPool = new WorkerPool<Dictionary<(string, string), IEnumerable<ObjectInfo>>>(8);
+            var workerPool = new WorkerPool<Dictionary<(string, string), IEnumerable<ObjectInfo>>>(workers);
             foreach (var appId in allAppIds)
             {
                 workerPool.AddWork(() => ScanApp(location, appId));
@@ -101,7 +178,7 @@ namespace QlikObjectUsageAnalyzer
 
         private static async Task<IEnumerable<string>> GetAllAppIds(IRestClient client)
         {
-            var next = client.Url + "/api/v1/items?resourceType=app&limit=100";
+            var next = client.Url + "/api/v1/items?resourceType=app&limit=10";
             var result = new List<string>();
             while (!string.IsNullOrWhiteSpace(next))
             {
@@ -114,16 +191,20 @@ namespace QlikObjectUsageAnalyzer
                 {
                     var title = appInfo["name"].Value<string>();
                     var id = appInfo["resourceId"].Value<string>();
-                    WriteLine($"  {id}: {title}");
+                    // WriteLine($"  {id}: {title}");
                     // WriteLine(appInfo.ToString());
                     result.Add(id);
                 }
+
+                var row = Console.CursorTop;
+                Console.SetCursorPosition(0,row);
+                Console.Write("Apps found: " + result.Count);
                 // WriteLine(appInfos["links"].ToString());
                 next = appInfos["links"]["next"]?["href"].Value<string>();
                 // yield break;
-                break;
+                // break;
             }
-
+            Console.WriteLine();
             return result;
         }
 
@@ -256,12 +337,12 @@ namespace QlikObjectUsageAnalyzer
             Write(msg + Environment.NewLine, writeToFile);
         }
 
-        private static StreamWriter _outputFile = new StreamWriter(@"C:\Tmp\objectScan.csv", false);
+        private static StreamWriter _outputFile = null;
 
         private static void Write(string msg, bool writeToFile = false)
         {
-            Console.Write(msg);
-            if (writeToFile) _outputFile.Write(msg);
+            if (_verbose || !writeToFile) Console.Write(msg);
+            if (writeToFile && _outputFile != null) _outputFile.Write(msg);
         }
     }
 }
