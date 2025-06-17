@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using Qlik.Engine;
+using Qlik.Engine.Communication;
 using Qlik.Sense.Client;
 using Qlik.Sense.RestClient;
 
@@ -17,6 +18,7 @@ namespace QlikObjectUsageAnalyzer
 	    {
 		    public string Url;
 		    public string ApiKey;
+            public string CertFolder;
 		    public int Workers = 8;
 		    public string OutputFile = null;
 		    public bool Verbose = false;
@@ -29,10 +31,17 @@ namespace QlikObjectUsageAnalyzer
                 {
 	                switch (args[i])
 	                {
+                        case "-h":
+                        case "--help":
+                            PrintUsage();
+                            Environment.Exit(1);
+                            break;
 		                case "-u":
 		                case "--url": result.Url = args[i + 1]; i++; break;
 		                case "-a":
 		                case "--apiKey": result.ApiKey = args[i + 1]; i++; break;
+                        case "-c":
+                        case "--certFolder": result.CertFolder = args[i + 1]; i++; break;
 		                case "-w":
 		                case "--workers": result.Workers = int.Parse(args[i + 1]); i++; break;
 		                case "-o":
@@ -51,9 +60,9 @@ namespace QlikObjectUsageAnalyzer
 	                Console.WriteLine($"Error processing arguments. Url not defined.");
 	                error = true;
                 }
-                if (result.ApiKey == null)
+                if (result.ApiKey == null && result.CertFolder == null)
                 {
-	                Console.WriteLine($"Error processing arguments. ApiKey not defined.");
+	                Console.WriteLine($"Error processing arguments. One of ApiKey or CertFolder must be defined.");
 	                error = true;
                 }
 
@@ -69,9 +78,11 @@ namespace QlikObjectUsageAnalyzer
 		    private static void PrintUsage()
 		    {
 			    var exe = System.AppDomain.CurrentDomain.FriendlyName;
-				Console.WriteLine($"Usage: {exe} <url> <apiKey> [<verbose>] [<workers>] [<output file>]");
-				Console.WriteLine($"  <url>         : (-u | --url) <string>");
-				Console.WriteLine($"  <apiKey>      : (-a | --apiKey) <string>");
+				Console.WriteLine($"Usage: {exe} <url> (<apiKey> | <cert folder>) [<help>] [<verbose>] [<workers>] [<output file>]");
+                Console.WriteLine($"  <help>        : (-h | --help) <string>, Print this message.");
+				Console.WriteLine($"  <url>         : (-u | --url) <string>, Url to connect to.");
+				Console.WriteLine($"  <apiKey>      : (-a | --apiKey) <string>, For connecting to QCS");
+                Console.WriteLine($"  <cert folder> : (-c | --certFolder) <file path>, For connecting to Client Managed");
 				Console.WriteLine($"  <workers>     : (-w | --workers) int, Number of apps to analyze concurrently. Default: 8");
 				Console.WriteLine($"  <output file> : (-o | --outputFile) <file path>, Default: Write to stdout only.");
 				Console.WriteLine($"  <verbose>     : (-v | --verbose), Write result to stdout even when writing to file. Default: false");
@@ -83,52 +94,94 @@ namespace QlikObjectUsageAnalyzer
         static void Main(string[] args)
         {
 	        var config = Arguments.ProcessArgs(args);
+            Func<string, bool, Task<IApp>> getAppFunc;
+            Func<Task<IEnumerable<string>>> getAllAppIdsFunc;
+
+            if (config.ApiKey != null)
+            {
+                (getAppFunc, getAllAppIdsFunc) = ConnectToQcs(config);
+            }
+            else
+            {
+                (getAppFunc, getAllAppIdsFunc) = ConnectToClientManaged(config);
+            }
 
             WriteLine($"Scanning object usage for URL: {config.Url}");
             WriteLine($"Using {config.Workers} workers.");
-            var location = QcsLocation.FromUri(config.Url);
-            location.AsApiKey(config.ApiKey);
-            location.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
-
-			var client = new RestClient(config.Url);
-            client.AsApiKeyViaQcs(config.ApiKey);
-            client.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
-
-			if (config.OutputFile != null)
+			
+            if (config.OutputFile != null)
             {
 	            WriteLine($"Writing result to file: {config.OutputFile}");
                 _outputFile = new StreamWriter(config.OutputFile, false);
                 _verbose = config.Verbose;
 			}
-            Main(location, client).Wait();
+            Main(getAppFunc, getAllAppIdsFunc).Wait();
         }
 
-        private static async Task Main(IQcsLocation location, RestClient client)
+        private static (Func<string, bool, Task<IApp>> getAppFunc, Func<Task<IEnumerable<string>>> getAllAppIdsFunc) ConnectToClientManaged(Arguments config)
         {
-            var opMonId = "";
-            var sheetUsage = await GetSheetUsage(location, opMonId);
+            WriteLine("Connecting to client managed using certificates.");
 
-            var allAppIds = (await GetAllAppIds(client)).ToArray();
+            var certs = CertificateManager.LoadCertificateFromDirectory(config.CertFolder);
+
+            var location = Location.FromUri(config.Url);
+            location.AsDirectConnection("INTERNAL", "sa_api", certs, false);
+            location.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
+
+            var client = new RestClient(config.Url);
+            client.AsDirectConnection("INTERNAL", "sa_api", 4242, false, certs);
+            client.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
+
+            Func<string, bool, Task<IApp>> getAppFunc = (appId, noData) => location.AppAsync(appId, Session.Random, noData);
+            Func<Task<IEnumerable<string>>> getAllAppIdsFunc = () => GetAllAppIdsClientManaged(client);
+
+            return (getAppFunc, getAllAppIdsFunc);
+        }
+
+        private static (Func<string, bool, Task<IApp>> getAppFunc, Func<Task<IEnumerable<string>>> getAllAppIdsFunc) ConnectToQcs(Arguments config)
+        {
+            WriteLine("Connecting to QCS using api key.");
+            
+            var location = QcsLocation.FromUri(config.Url);
+            location.AsApiKey(config.ApiKey);
+            location.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
+
+            var client = new RestClient(config.Url);
+            client.AsApiKeyViaQcs(config.ApiKey);
+            client.CustomUserAgent = System.AppDomain.CurrentDomain.FriendlyName;
+
+            Func<string, bool, Task<IApp>> getAppFunc = (appId, noData) => location.AppAsync(appId, SessionToken.Unique(), noData);
+            Func<Task<IEnumerable<string>>> getAllAppIdsFunc = () => GetAllAppIdsQcs(client);
+
+            return (getAppFunc, getAllAppIdsFunc);
+        }
+
+        private static async Task Main(Func<string, bool, Task<IApp>> getAppFunc, Func<Task<IEnumerable<string>>> getAllAppIdsFunc)
+        {
+            // var opMonId = "";
+            // var sheetUsage = await GetSheetUsage(location, opMonId);
+            var sheetUsage = await GetSheetUsage();
+
+            var allAppIds = (await getAllAppIdsFunc()).ToArray();
 
             WriteLine($"Scanning {allAppIds.Length} apps.");
             // return;
             var sw = new Stopwatch();
             sw.Start();
-            var allContents = await ScanAllApps(location, allAppIds, 8);
+            var allContents = await ScanAllApps(getAppFunc, allAppIds, 8);
             PrintSheetContentsTable(allContents, sheetUsage);
             sw.Stop();
-            WriteLine();
             WriteLine($"Found {allContents.Count} objects.");
             WriteLine("Total time: " + sw.Elapsed);
         }
 
-        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanAllApps(IQcsLocation location, string[] allAppIds, int workers)
+        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanAllApps(Func<string, bool, Task<IApp>> getAppFunc, string[] allAppIds, int workers)
         {
             var result = new Dictionary<(string, string), IEnumerable<ObjectInfo>>();
             var workerPool = new WorkerPool<Dictionary<(string, string), IEnumerable<ObjectInfo>>>(workers);
             foreach (var appId in allAppIds)
             {
-                workerPool.AddWork(() => ScanApp(location, appId));
+                workerPool.AddWork(() => ScanApp(getAppFunc, appId, false));
             }
 
             var cnt = 0;
@@ -136,12 +189,13 @@ namespace QlikObjectUsageAnalyzer
             {
                 var contents = await workerPool.GetResult();
                 Write(GetSymbol(cnt++));
-                foreach (var (key, content) in contents)
+                foreach (var kv in contents)
                 {
-                    result[key] = content;
+                    result[kv.Key] = kv.Value;
                 }
             }
 
+            WriteLine();
             return result;
         }
 
@@ -154,17 +208,17 @@ namespace QlikObjectUsageAnalyzer
             return ".";
         }
 
-        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanApp(IQcsLocation location, string appId, bool verbose = false)
+        private static async Task<Dictionary<(string, string), IEnumerable<ObjectInfo>>> ScanApp(Func<string, bool, Task<IApp>> getAppFunc, string appId, bool verbose = false)
         {
             if (verbose) Write($"Connecting to app: {appId}... ");
             try
             {
-                using (var app = await location.AppAsync(appId, SessionToken.Unique(), noData: true))
+                using (var app = await getAppFunc(appId, true))
                 {
                     if (verbose) WriteLine("Done!");
                     var sheetContents = await GetSheetContents(appId, app);
                     if (verbose) WriteLine($"Sheet contents collected for app: {appId}");
-//                PrintSheetContents(sheetContents);
+                    // PrintSheetContents(sheetContents);
                     // PrintSheetContentsTable(appId, sheetContents, sheetUsage);
                     return sheetContents;
                 }
@@ -176,7 +230,13 @@ namespace QlikObjectUsageAnalyzer
             }
         }
 
-        private static async Task<IEnumerable<string>> GetAllAppIds(IRestClient client)
+        private static async Task<IEnumerable<string>> GetAllAppIdsClientManaged(IRestClient client)
+        {
+            var allAppInfo = await client.GetAsync<JArray>("/qrs/app");
+            return allAppInfo.OfType<JObject>().Select(info => info["id"].Value<string>()).ToArray();
+        }
+
+        private static async Task<IEnumerable<string>> GetAllAppIdsQcs(IRestClient client)
         {
             var next = client.Url + "/api/v1/items?resourceType=app&limit=100";
             var result = new List<string>();
@@ -211,6 +271,12 @@ namespace QlikObjectUsageAnalyzer
                 next = appInfos["links"]["next"]?["href"].Value<string>();
             }
             Console.WriteLine();
+            return result;
+        }
+
+        private static async Task<Dictionary<(string, string), int>> GetSheetUsage()
+        {
+            var result = new Dictionary<(string, string), int>();
             return result;
         }
 
